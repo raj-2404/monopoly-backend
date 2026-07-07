@@ -33,6 +33,7 @@ public class RoomService {
     private final TradeOfferPropertyRepository tradeOfferPropertyRepository;
     private final TransactionRepository transactionRepository;
     private final OwnedPropertyRepository ownedPropertyRepository;
+    private final TurnService turnService;
     private final Random random = new SecureRandom();
 
     public RoomService(GameRoomRepository gameRoomRepository,
@@ -47,7 +48,8 @@ public class RoomService {
                        TradeOfferRepository tradeOfferRepository,
                        TradeOfferPropertyRepository tradeOfferPropertyRepository,
                        TransactionRepository transactionRepository,
-                       OwnedPropertyRepository ownedPropertyRepository) {
+                       OwnedPropertyRepository ownedPropertyRepository,
+                       TurnService turnService) {
         this.gameRoomRepository = gameRoomRepository;
         this.playerRepository = playerRepository;
         this.userRepository = userRepository;
@@ -61,6 +63,7 @@ public class RoomService {
         this.tradeOfferPropertyRepository = tradeOfferPropertyRepository;
         this.transactionRepository = transactionRepository;
         this.ownedPropertyRepository = ownedPropertyRepository;
+        this.turnService = turnService;
     }
 
     @Transactional
@@ -162,7 +165,42 @@ public class RoomService {
                 .orElseThrow(() -> new PlayerNotFoundException("Player not found in room"));
 
         if (room.getStatus() == RoomStatus.PLAYING) {
-            deleteMatch(roomId);
+            Optional<Game> gameOpt = gameRepository.findById(roomId);
+            if (gameOpt.isPresent() && gameOpt.get().getStatus() == GameStatus.STARTED) {
+                Game game = gameOpt.get();
+                // Set the leaving player as bankrupt (eliminated)
+                financialService.declareBankruptcy(game, player);
+
+                // If it was their turn, advance it
+                if (game.getCurrentTurnPlayerId() != null && game.getCurrentTurnPlayerId().equals(player.getId())) {
+                    Player nextPlayer = turnService.determineNextPlayer(game);
+                    if (nextPlayer != null) {
+                        nextPlayer.setHasBuiltHouseThisTurn(false);
+                        playerRepository.save(nextPlayer);
+                        game.setCurrentTurnPlayerId(nextPlayer.getId());
+                        game.setPendingAction(PendingAction.NONE);
+                        game.setHasRolled(false);
+                        gameRepository.save(game);
+                        eventPublisher.publish(game.getId(), GameEvent.of(EventType.TURN_CHANGED, game.getId(), Map.of(
+                                "currentPlayerId", nextPlayer.getId()
+                        ), game.getVersion()));
+                    }
+                }
+
+                // Publish bankrupt event
+                eventPublisher.publish(game.getId(), GameEvent.of(EventType.PLAYER_BANKRUPT, game.getId(), Map.of(
+                        "playerId", player.getId()
+                ), game.getVersion()));
+
+                // Check if game finished and publish finish event
+                if (game.getStatus() == GameStatus.FINISHED) {
+                    room.setStatus(RoomStatus.FINISHED);
+                    gameRoomRepository.save(room);
+                    eventPublisher.publish(game.getId(), GameEvent.of(EventType.GAME_FINISHED, game.getId(), Map.of(
+                            "winnerId", game.getWinnerId()
+                    ), game.getVersion()));
+                }
+            }
             return null;
         }
 
